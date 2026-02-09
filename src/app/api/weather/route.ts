@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import http from "http";
 
+// Disable Next.js caching for this route
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 // Use 127.0.0.1 instead of localhost for better compatibility with Next.js server-side fetch
 const API_BASE_URL = process.env.WEATHER_API_URL || "http://127.0.0.1:6000";
 const AUTH_TOKEN = "JOECOOL123";
@@ -53,6 +57,8 @@ const INITIAL_REPORTS = [
 
 // Flag to track if initialization has been attempted (module-level, resets on server restart)
 let initializationAttempted = false;
+// Flag to track if a delete all just happened (to prevent immediate re-initialization)
+let justDeletedAll = false;
 
 // Helper function to make HTTP requests using Node.js http module
 function makeHttpRequest(
@@ -89,14 +95,36 @@ function makeHttpRequest(
         try {
           // Handle empty responses (common for DELETE requests)
           if (!data || data.trim() === "") {
-            resolve({ status: res.statusCode || 200, data: {} });
+            // For DELETE requests, return empty array instead of empty object
+            // This helps avoid interceptor errors that expect arrays
+            // For other requests, return empty object to maintain original behavior
+            const isDeleteRequest = method === "DELETE";
+            resolve({ 
+              status: res.statusCode || 200, 
+              data: isDeleteRequest ? [] : (method === "GET" ? [] : {})
+            });
             return;
           }
           const parsedData = JSON.parse(data);
+          // For DELETE requests, ensure we always return an array
+          // This helps avoid interceptor errors that expect arrays
+          // Only transform DELETE responses, leave GET/POST/PATCH as-is
+          if (method === "DELETE" && !Array.isArray(parsedData)) {
+            resolve({ status: res.statusCode || 200, data: [] });
+            return;
+          }
           resolve({ status: res.statusCode || 200, data: parsedData });
         } catch {
-          // If JSON parsing fails, return the raw data or empty object
-          resolve({ status: res.statusCode || 200, data: data || {} });
+          // If JSON parsing fails, return the raw data or empty object/array
+          // For GET requests, return empty array (expected format)
+          // For DELETE requests, return empty array
+          // For other requests, return empty object
+          const isDeleteRequest = method === "DELETE";
+          const isGetRequest = method === "GET";
+          resolve({ 
+            status: res.statusCode || 200, 
+            data: (isDeleteRequest || isGetRequest) ? [] : (data || {}) 
+          });
         }
       });
     });
@@ -115,11 +143,6 @@ function makeHttpRequest(
 
 // Helper function to initialize the API with sample data
 async function initializeApiData() {
-  // Prevent multiple simultaneous initialization attempts
-  if (initializationAttempted) {
-    return;
-  }
-
   try {
     // Check current state of API
     const response = await makeHttpRequest(`${API_BASE_URL}/weather`, {
@@ -133,6 +156,27 @@ async function initializeApiData() {
 
     const data = response.data;
     
+    // If a delete all just happened, don't initialize immediately
+    // Reset the flag so next refresh will initialize
+    if (justDeletedAll) {
+      console.log("Delete all just happened, skipping immediate initialization");
+      justDeletedAll = false;
+      initializationAttempted = false; // Reset flag for next refresh
+      return;
+    }
+    
+    // Prevent multiple simultaneous initialization attempts
+    if (initializationAttempted) {
+      console.log("Initialization already attempted, skipping");
+      return;
+    }
+    
+    // If API is empty, initialize it
+    if (Array.isArray(data) && data.length === 0) {
+      console.log("API is empty, initializing with sample data");
+      // Continue to initialization below
+    }
+    
     // Check if we need to initialize
     if (Array.isArray(data) && data.length > 0) {
       // Check if we have all the expected initial reports
@@ -145,6 +189,7 @@ async function initializeApiData() {
       
       if (missingCities.length === 0) {
         console.log(`API already has all ${INITIAL_REPORTS.length} initial reports, skipping initialization`);
+        initializationAttempted = true;
         return;
       }
       
@@ -263,10 +308,23 @@ export async function GET(request: NextRequest) {
     });
 
     if (response.status >= 400) {
-      return NextResponse.json(response.data, { status: response.status });
+      return NextResponse.json(response.data, { 
+        status: response.status,
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      });
     }
 
-    return NextResponse.json(response.data);
+    return NextResponse.json(response.data, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    });
   } catch (error: any) {
     console.error("API proxy error:", error);
     const errorMessage = error?.message || "Unknown error";
@@ -328,11 +386,78 @@ export async function DELETE(request: NextRequest) {
       },
     });
 
+    console.log(`DELETE all response status: ${response.status}`);
+    console.log(`DELETE all response data:`, JSON.stringify(response.data, null, 2));
+
+    // The interceptor error happens on the backend side before we get the response
+    // Even if the backend returns an error (500), the delete might have succeeded
+    // We need to handle this gracefully
     if (response.status === 200 || response.status === 204) {
-      return NextResponse.json({ success: true }, { status: 200 });
+      // Set flag to prevent immediate re-initialization when fetchReports() is called after delete
+      justDeletedAll = true;
+      // Return empty array to match expected format
+      return NextResponse.json([], { 
+        status: 200,
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
+      });
     }
 
-    return NextResponse.json(response.data, { status: response.status });
+    // If we get a 500 error, it's likely the interceptor bug
+    // The delete might have actually worked despite the error
+    // Let's verify by checking if there are any reports left
+    if (response.status === 500) {
+      // Temporarily set flag to prevent initialization during check
+      const wasAttempted = initializationAttempted;
+      initializationAttempted = true;
+      
+      try {
+        // Try to fetch all reports to see if any remain
+        const checkResponse = await makeHttpRequest(`${API_BASE_URL}/weather`, {
+          method: "GET",
+        });
+        
+        // If no reports exist (empty array), the delete actually worked
+        if (checkResponse.status === 200 && Array.isArray(checkResponse.data) && checkResponse.data.length === 0) {
+          console.log("Delete all actually succeeded despite 500 error (interceptor bug)");
+          // Restore flag
+          initializationAttempted = wasAttempted;
+          // Set flag to prevent immediate re-initialization when fetchReports() is called after delete
+          justDeletedAll = true;
+          return NextResponse.json([], { 
+            status: 200,
+            headers: {
+              'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+              'Pragma': 'no-cache',
+              'Expires': '0',
+            },
+          });
+        }
+        
+        // Restore flag if delete didn't work
+        initializationAttempted = wasAttempted;
+      } catch (checkError) {
+        // Restore flag on error
+        initializationAttempted = wasAttempted;
+        // If check fails, assume delete might have worked
+        console.log("Could not verify delete all status, but might have succeeded");
+      }
+    }
+
+    // Return the error response as-is
+    // Ensure we return an array if response.data is not already an array
+    const errorData = Array.isArray(response.data) ? response.data : [];
+    return NextResponse.json(errorData, { 
+      status: response.status,
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
+    });
   } catch (error: any) {
     console.error("API proxy error:", error);
     const errorMessage = error?.message || "Unknown error";

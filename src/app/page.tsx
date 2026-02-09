@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { WeatherReport, UserType, ErrorModal, WeatherFormData } from "./types";
+import { WeatherReport, UserType, ErrorModal, ConfirmationModal, WeatherFormData } from "./types";
 import ErrorModalComponent from "./components/ErrorModal";
+import ConfirmationModalComponent from "./components/ConfirmationModal";
 import WeatherFormModal from "./components/WeatherFormModal";
 import WeatherDisplay from "./components/WeatherDisplay";
 import WeatherHeader from "./components/WeatherHeader";
@@ -14,6 +15,7 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [userType, setUserType] = useState<UserType>("authenticated");
   const [errorModal, setErrorModal] = useState<ErrorModal>({ show: false, message: "" });
+  const [confirmationModal, setConfirmationModal] = useState<ConfirmationModal>({ show: false, message: "" });
   const [showEditModal, setShowEditModal] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [editingReport, setEditingReport] = useState<WeatherReport | null>(null);
@@ -164,7 +166,7 @@ export default function Home() {
     }
   };
 
-  const handleDeleteAll = async () => {
+  const handleDeleteAll = () => {
     if (userType !== "authenticated") {
       setErrorModal({
         show: true,
@@ -173,9 +175,14 @@ export default function Home() {
       return;
     }
 
-    if (!confirm("Are you sure you want to delete all weather reports?")) {
-      return;
-    }
+    setConfirmationModal({
+      show: true,
+      message: "Are you sure you want to delete all weather reports?",
+    });
+  };
+
+  const confirmDeleteAll = async () => {
+    setConfirmationModal({ show: false, message: "" });
 
     try {
       const res = await fetch("/api/weather", {
@@ -194,6 +201,8 @@ export default function Home() {
       }
 
       await fetchReports();
+      setSelectedReport(null);
+      setSelectedReportId("");
     } catch (error) {
       setErrorModal({
         show: true,
@@ -388,6 +397,12 @@ export default function Home() {
       <ErrorModalComponent
         errorModal={errorModal}
         onClose={() => setErrorModal({ show: false, message: "" })}
+      />
+
+      <ConfirmationModalComponent
+        confirmationModal={confirmationModal}
+        onConfirm={confirmDeleteAll}
+        onCancel={() => setConfirmationModal({ show: false, message: "" })}
       />
 
       <WeatherFormModal

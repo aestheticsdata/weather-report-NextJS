@@ -21,6 +21,11 @@ export type ErrorModal = {
   message: string;
 };
 
+export type ConfirmationModal = {
+  show: boolean;
+  message: string;
+};
+
 export type WeatherFormData = {
   city: string;
   country: string;
